@@ -122,6 +122,26 @@ nix run github:rikkichy/openwave
 
 The flake exports `packages.x86_64-linux.openwave` and its default package. On NixOS, add the package to `services.udev.packages` for declarative USB permissions, as well as installing it for your user. Launchers carry runtime tool paths and the LADSPA search path. Building a package does not establish physical acceptance for every enabled device profile.
 
+To use the pinned prebuilt release instead of compiling Rust:
+
+```bash
+nix run github:rikkichy/openwave#openwave-bin
+```
+
+`packages.x86_64-linux.openwave-bin` repackages the official Ubuntu release with
+Nix library paths, the same runtime wrappers and udev rules, and a Nix-owned
+installation receipt. Use this same output for both application installation
+and `services.udev.packages`. The source package remains the default for development.
+Binary packaging still performs extraction and ELF relocation; it needs no
+Rust compiler or custom binary cache.
+
+`packaging/openwave-bin.nix` pins an already-published release independently of
+development `VERSION`. Advance its version, URL and hash only after publication:
+the release workflow runs tests before creating the next release assets.
+The Tests workflow builds `checks.x86_64-linux.installed-bin`, which executes
+the installed informational commands and verifies ownership, payload and udev
+rules. This is not hardware/audio or GUI acceptance.
+
 ### Bazzite / Fedora Atomic
 
 Use the [native host checkout or user-prefix installation](docs/install-bazzite.md). Do not use the mutable-distribution installer to modify an Atomic system, or assume a distrobox has host USB, ALSA and PipeWire integration.

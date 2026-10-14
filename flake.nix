@@ -63,6 +63,18 @@
           e = environment system;
           inherit (e) pkgs;
           runtimeBins = pkgs.lib.makeBinPath e.runtimeTools;
+          wrapLaunchers = ''
+            wrapProgram "$out/bin/openwave" \
+              --prefix PATH : ${runtimeBins} \
+              --prefix LADSPA_PATH : ${pkgs.ladspaPlugins}/lib/ladspa \
+              --prefix XDG_DATA_DIRS : ${pkgs.adwaita-icon-theme}/share \
+              "''${gappsWrapperArgs[@]}"
+            for launcher in openwave-daemon openwave-diag openwave-probe; do
+              wrapProgram "$out/bin/$launcher" \
+                --prefix PATH : ${runtimeBins} \
+                --prefix LADSPA_PATH : ${pkgs.ladspaPlugins}/lib/ladspa
+            done
+          '';
         in rec {
           openwave = e.rustPlatform.buildRustPackage {
             pname = "openwave";
@@ -84,18 +96,7 @@
             '';
             # Manager ownership outranks the pre-wrapper receipt hashes.
             dontWrapGApps = true;
-            preFixup = ''
-              wrapProgram "$out/bin/openwave" \
-                --prefix PATH : ${runtimeBins} \
-                --prefix LADSPA_PATH : ${pkgs.ladspaPlugins}/lib/ladspa \
-                --prefix XDG_DATA_DIRS : ${pkgs.adwaita-icon-theme}/share \
-                "''${gappsWrapperArgs[@]}"
-              for launcher in openwave-daemon openwave-diag openwave-probe; do
-                wrapProgram "$out/bin/$launcher" \
-                  --prefix PATH : ${runtimeBins} \
-                  --prefix LADSPA_PATH : ${pkgs.ladspaPlugins}/lib/ladspa
-              done
-            '';
+            preFixup = wrapLaunchers;
             meta = {
               description = "Linux control application for Elgato Wave devices";
               homepage = "https://github.com/rikkichy/openwave";
@@ -103,6 +104,10 @@
               mainProgram = "openwave";
               platforms = [ "x86_64-linux" ];
             };
+          };
+          openwave-bin = pkgs.callPackage ./packaging/openwave-bin.nix {
+            libraries = e.libraries;
+            inherit wrapLaunchers;
           };
           default = openwave;
         });
@@ -112,6 +117,7 @@
           e = environment system;
           inherit (e) pkgs;
           package = self.packages.${system}.openwave;
+          binary = self.packages.${system}.openwave-bin;
         in {
           native = package;
           installed = pkgs.runCommand "openwave-installed-native-proof" {
@@ -133,6 +139,35 @@
             test -s ${package}/lib/udev/rules.d/99-openwave.rules
             mkdir -p "$out"
             printf '%s\n' '${system}: built and executed installed native informational paths' > "$out/result"
+          '';
+          installed-bin = pkgs.runCommand "openwave-installed-binary-proof" {
+            nativeBuildInputs = [ pkgs.jq pkgs.systemd ];
+          } ''
+            export HOME="$TMPDIR/home"
+            export XDG_CONFIG_HOME="$HOME/config" XDG_DATA_HOME="$HOME/data"
+            export XDG_STATE_HOME="$HOME/state" XDG_RUNTIME_DIR="$HOME/run"
+            mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+            chmod 700 "$HOME" "$XDG_RUNTIME_DIR"
+            cd "$TMPDIR"
+            for executable in openwave openwave-daemon openwave-diag openwave-probe; do
+              ${binary}/bin/$executable --help
+              test "$(${binary}/bin/$executable --version)" = "$executable ${binary.version}"
+            done
+            helper=${binary}/libexec/openwave-maintenance
+            test "$("$helper" --version)" = "openwave-maintenance ${binary.version}"
+            "$helper" version --file ${binary}/share/openwave/VERSION --tag v${binary.version}
+            receipt=${binary}/share/openwave/install-manifest.json
+            jq -e --arg prefix ${binary} '
+              .schema == 2 and .application == "openwave" and
+              .method == "nix" and .prefix == $prefix and
+              all(.files[]; startswith($prefix + "/"))
+            ' "$receipt"
+            while IFS= read -r file; do
+              test -f "$file"
+            done < <(jq -r '.files[]' "$receipt")
+            udevadm verify ${binary}/lib/udev/rules.d/99-openwave.rules
+            mkdir -p "$out"
+            printf '%s\n' '${system}: executed release binaries and verified Nix ownership, payload and udev rules' > "$out/result"
           '';
         });
 
