@@ -275,6 +275,7 @@ impl ControllerRig {
             .send(BackendEvent::Status {
                 service: label.clone(),
                 setup_required: false,
+                usb_update: false,
             })
             .unwrap();
         self.wait(|s| s.service_status == label);
