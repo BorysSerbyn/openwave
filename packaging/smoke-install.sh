@@ -423,6 +423,8 @@ assert_state '.outputs.personal == "none"'
 /smoke-control action toggle-source-mute "'music'"
 assert_state '.sources[] | select(.id == "music") | .muted'
 /smoke-control record openwave_capture_personal /work/evidence/source-muted.f32 0
+/smoke-control external-unmute /work/evidence/external-unmute.json
+/smoke-control record openwave_capture_personal /work/evidence/external-unmute-restored.f32 0
 /smoke-control action toggle-source-mute "'music'"
 /smoke-control action switch-group "'Mics'"
 assert_state '([.sources[] | select(.group == "Mics" and .muted == false)] | length) == 1 and ([.sources[] | select(.id == "mic_b" and .muted == false)] | length) == 1'

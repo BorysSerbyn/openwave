@@ -466,6 +466,38 @@ fn break_link(file: &Path) -> Result {
         Ok(())
     })
 }
+fn external_unmute(file: &Path) -> Result {
+    let name = "openwave_loop_5_music_personal";
+    let before = graph()?;
+    let route = node(&before, name)?;
+    let muted = |node: &Value| {
+        node["info"]["params"]["Props"]
+            .as_array()
+            .is_some_and(|props| props.iter().any(|props| props["mute"] == true))
+    };
+    if route["info"]["props"]["openwave.owner"]
+        .as_str()
+        .is_none_or(str::is_empty)
+        || !muted(route)
+    {
+        return Err("Expected an owned, observed-muted fixture route".into());
+    }
+    let original = identity(&before, name)?;
+    command("wpctl", &["set-mute", &route["id"].to_string(), "0"])?;
+    let restored = wait_for("external route unmute to be corrected", || {
+        let after = graph()?;
+        let route = node(&after, name)?;
+        if identity(&after, name)? != original || !muted(route) {
+            return Err("Original route is not observed muted".into());
+        }
+        Ok(route.clone())
+    })?;
+    fs::write(
+        file,
+        serde_json::to_vec_pretty(&json!({"before":route,"restored":restored}))?,
+    )?;
+    Ok(())
+}
 const WATCHER: &str = r#"<node><interface name="org.kde.StatusNotifierWatcher">
 <method name="RegisterStatusNotifierItem"><arg type="s" direction="in"/></method>
 <method name="RegisterStatusNotifierHost"><arg type="s" direction="in"/></method>
@@ -952,10 +984,11 @@ fn run() -> Result {
         "record" => record(arg(1)?,arg(2)?,arg(3)?.parse()?),
         "assert-routes" => wait_for("exclusive intake and missing-output silence",route_assert),
         "break-link" => break_link(Path::new(arg(1)?)),
+        "external-unmute" => external_unmute(Path::new(arg(1)?)),
         "watcher" => watcher(arg(1)?,arg(2)?),
         "tray" => tray(arg(1)?,arg(2)?),
         "ui" => ui(arg(1)?,args.get(2).map_or("",String::as_str),args.get(3).map(String::as_str)),
-        _ => Err("Commands: fixtures, fixture-output, tone, state, action, window-action, activate, identity, wait-node, link-fixture, record, assert-routes, break-link, watcher, tray, ui".into()),
+        _ => Err("Commands: fixtures, fixture-output, tone, state, action, window-action, activate, identity, wait-node, link-fixture, record, assert-routes, break-link, external-unmute, watcher, tray, ui".into()),
     }
 }
 fn main() {

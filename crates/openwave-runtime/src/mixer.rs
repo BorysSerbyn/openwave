@@ -128,6 +128,8 @@ pub struct GraphNode {
     pub identity: NodeIdentity,
     pub name: String,
     pub properties: Map<String, Value>,
+    /// Current node Props mute; missing or malformed parameters are unknown.
+    pub muted: Option<bool>,
 }
 #[derive(Clone, Debug)]
 pub struct GraphPort {
@@ -284,6 +286,13 @@ impl GraphSnapshot {
                     identity,
                     name,
                     properties: props.clone(),
+                    muted: info
+                        .get("params")
+                        .and_then(|params| params.get("Props"))
+                        .and_then(Value::as_array)
+                        .filter(|props| props.len() == 1)
+                        .and_then(|props| props[0].get("mute"))
+                        .and_then(Value::as_bool),
                 });
             } else {
                 let direction = required_text(props.get("port.direction"), "port.direction")?;
@@ -2055,14 +2064,26 @@ impl Reconciler {
                 }
                 match graph.owned(&route.name, &route.owner) {
                     Some(node) => {
-                        self.backend
-                            .set_level(node.id, volume * source.level, true)
-                            .map_err(|error| {
-                                unavailable(format!(
-                                    "Cannot silence {sid}; group handover deferred: {error}"
-                                ))
-                            })?;
-                        route.applied = Some((node.identity.clone(), volume * source.level, true));
+                        let level = volume * source.level;
+                        // Cached intent alone cannot prove silence: another client can
+                        // unmute the same owned node without changing its identity.
+                        if node.muted != Some(true)
+                            || route
+                                .applied
+                                .as_ref()
+                                .is_none_or(|(identity, applied, muted)| {
+                                    identity != &node.identity || *applied != level || !*muted
+                                })
+                        {
+                            self.backend
+                                .set_level(node.id, level, true)
+                                .map_err(|error| {
+                                    unavailable(format!(
+                                        "Cannot silence {sid}; group handover deferred: {error}"
+                                    ))
+                                })?;
+                            route.applied = Some((node.identity.clone(), level, true));
+                        }
                         route.node = Some(node.id);
                     }
                     None => {

@@ -492,14 +492,21 @@ struct Bindings {
     list: gtk::ListBox,
     names: RefCell<Vec<String>>,
     pending: adw::EntryRow,
+    name: adw::EntryRow,
     confirm: gtk::glib::WeakRef<gtk::Button>,
+}
+/// A name alone is sufficient; otherwise the first binding supplies the name.
+fn can_save_app_source(name: &str, names: &[String], pending: &str) -> bool {
+    !name.trim().is_empty() || !names.is_empty() || !typed_names(pending).is_empty()
 }
 impl Bindings {
     fn valid(&self) {
         if let Some(confirm) = self.confirm.upgrade() {
-            confirm.set_sensitive(
-                !self.names.borrow().is_empty() || !typed_names(&self.pending.text()).is_empty(),
-            );
+            confirm.set_sensitive(can_save_app_source(
+                &self.name.text(),
+                &self.names.borrow(),
+                &self.pending.text(),
+            ));
         }
     }
     fn add(self: &Rc<Self>, text: &str) {
@@ -591,6 +598,7 @@ fn source_config(
             list,
             names: RefCell::new(source.match_app_names.clone()),
             pending: pending.clone(),
+            name: name.clone(),
             confirm: save.downgrade(),
         });
         let weak = Rc::downgrade(&bindings);
@@ -609,12 +617,14 @@ fn source_config(
                 b.pending.set_text("");
             }
         });
-        let weak = Rc::downgrade(&bindings);
-        pending.connect_changed(move |_| {
-            if let Some(b) = weak.upgrade() {
-                b.valid();
-            }
-        });
+        for entry in [&pending, &name] {
+            let weak = Rc::downgrade(&bindings);
+            entry.connect_changed(move |_| {
+                if let Some(b) = weak.upgrade() {
+                    b.valid();
+                }
+            });
+        }
         let running = gtk::MenuButton::builder()
             .label("From running apps")
             .halign(gtk::Align::Start)
@@ -676,9 +686,6 @@ fn source_config(
             b.add_typed(&text);
             b.names.borrow().clone()
         });
-        if names.as_ref().is_some_and(Vec::is_empty) {
-            return;
-        }
         let text = name.text().trim().to_owned();
         let text = if text.is_empty() {
             names
@@ -734,6 +741,18 @@ mod tests {
     }
 
     #[test]
+    fn app_source_save_rule_accepts_names_or_real_bindings() {
+        let none: [String; 0] = [];
+        assert!(can_save_app_source(" Work ", &none, ""));
+        assert!(can_save_app_source("Work", &none, " , , "));
+        assert!(can_save_app_source("", &["Player".into()], ""));
+        assert!(can_save_app_source("", &none, " , Player, player-bin, "));
+        for pending in ["", "  ", ",", " , , "] {
+            assert!(!can_save_app_source(" \t ", &none, pending));
+        }
+    }
+
+    #[test]
     #[ignore = "requires the isolated installed GTK test runner"]
     fn manual_pending_binding_creates_named_application() {
         adw::init().expect("private GTK display");
@@ -782,7 +801,7 @@ mod tests {
             .find(|row| row.title() == "Add an application")
             .unwrap();
         assert!(name.text().is_empty());
-        pending.set_text("  Player  ");
+        pending.set_text(" , Player, player-bin, Player, ");
         let save = descendants::<gtk::Button>(&page)
             .into_iter()
             .find(|button| button.label().as_deref() == Some("Add Source"))
@@ -801,7 +820,123 @@ mod tests {
             .find(|source| source.name == "Player")
             .unwrap();
         assert_eq!(source.kind, SourceKind::App);
-        assert_eq!(source.match_app_names, ["Player"]);
+        assert_eq!(source.match_app_names, ["Player", "player-bin"]);
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires the isolated installed GTK test runner"]
+    fn named_application_without_bindings_can_be_created() {
+        adw::init().expect("private GTK display");
+        let rig = Rig::new(serde_json::json!({}), vec![]);
+        let window = adw::Window::new();
+        window.present();
+        let (dialog, nav) = navigation_dialog("Add Source", 480, 560);
+        source_config(
+            &dialog,
+            &nav,
+            Source::new(String::new(), SourceKind::App),
+            false,
+            rig.snapshot(),
+            icons(),
+            rig.submitter(),
+        );
+        dialog.present(Some(&window));
+        let page = nav.visible_page().unwrap();
+        let entries = descendants::<adw::EntryRow>(&page);
+        let name = entries
+            .iter()
+            .find(|row| row.title() == "Source name")
+            .unwrap();
+        let pending = entries
+            .iter()
+            .find(|row| row.title() == "Add an application")
+            .unwrap();
+        let save = descendants::<gtk::Button>(&page)
+            .into_iter()
+            .find(|button| button.label().as_deref() == Some("Add Source"))
+            .unwrap();
+        assert!(!save.is_sensitive());
+        name.set_text(" \t ");
+        pending.set_text(" , , ");
+        assert!(!save.is_sensitive());
+        // Even a directly emitted signal must retain the final empty-name guard.
+        save.emit_clicked();
+        rig.finish_submissions();
+        assert!(rig.snapshot().desired.sources.is_empty());
+        name.set_text("Player");
+        assert!(save.is_sensitive(), "a name alone enables Add Source");
+        name.set_text("");
+        assert!(!save.is_sensitive(), "clearing the name revalidates");
+        name.set_text(" Player ");
+        assert!(save.is_sensitive());
+        save.emit_clicked();
+        rig.finish_submissions();
+        let snapshot = rig.snapshot();
+        assert_eq!(snapshot.desired.sources.len(), 1);
+        let source = snapshot.desired.sources.values().next().unwrap();
+        assert_eq!(source.name, "Player");
+        assert!(source.match_app_names.is_empty());
+        let persisted: Sources = serde_json::from_slice(
+            &std::fs::read(rig.paths().identity.join("sources.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.get(&source.id), Some(source));
+        window.destroy();
+    }
+
+    #[test]
+    #[ignore = "requires the isolated installed GTK test runner"]
+    fn named_application_can_remove_its_last_binding() {
+        adw::init().expect("private GTK display");
+        let rig = Rig::new(serde_json::json!({}), vec![]);
+        let mut source = Source::new("Player".into(), SourceKind::App);
+        source.match_app_names.push("Player".into());
+        let id = source.id.clone();
+        rig.submitter()(AppCommand::AddSource { source });
+        rig.finish_submissions();
+        let window = adw::Window::new();
+        window.present();
+        edit_source(
+            window.upcast_ref(),
+            &id,
+            rig.snapshot(),
+            icons(),
+            rig.submitter(),
+        );
+        let dialog = window.visible_dialog().expect("Edit Source dialog");
+        let nav = dialog
+            .child()
+            .unwrap()
+            .downcast::<adw::NavigationView>()
+            .unwrap();
+        let page = nav.visible_page().unwrap();
+        let buttons = descendants::<gtk::Button>(&page);
+        let remove = buttons
+            .iter()
+            .find(|button| button.tooltip_text().as_deref() == Some("Stop matching Player"))
+            .unwrap();
+        let save = buttons
+            .iter()
+            .find(|button| button.label().as_deref() == Some("Save"))
+            .unwrap();
+        remove.emit_clicked();
+        assert!(
+            save.is_sensitive(),
+            "the source name survives its last binding"
+        );
+        save.emit_clicked();
+        rig.finish_submissions();
+        let snapshot = rig.snapshot();
+        assert_eq!(snapshot.desired.sources.len(), 1);
+        let source = snapshot.desired.sources.get(&id).unwrap();
+        assert_eq!(source.name, "Player");
+        assert!(source.match_app_names.is_empty());
+        let persisted: Sources = serde_json::from_slice(
+            &std::fs::read(rig.paths().identity.join("sources.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.get(&id), Some(source));
         window.destroy();
     }
 }

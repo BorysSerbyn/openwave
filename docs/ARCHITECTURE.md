@@ -55,6 +55,8 @@ device capture ----> optional DSP ------+      |
 
 A source is a row; a mix is a column. Application rows match live streams using normalized exact application/node/binary identities. Claims are deterministic: match specificity, then stable source ID breaks ties; a catch-all receives otherwise unclaimed streams. One stream has one owner, preventing two matching rows from summing duplicate copies.
 
+A named application source may have no application bindings, including after removing its last binding in Edit Source. Its intake remains available for explicit stream targeting such as `PULSE_SINK=openwave_src_<source_id>`; empty bindings do not mean catch-all. Typed bindings are comma-separated, and the first real binding supplies a missing source name. Whitespace or commas alone cannot supply that name.
+
 An application stream is **moved**, not copied, into `openwave_src_<source_id>`. Copying while leaving original playback in a mix would make a zero send unable to silence the original. Claimed applications remain managed even with every send at zero: that means silence, not a bypass. Removing a row or binding releases its stream claims. Restoration uses the recorded original sink if available, otherwise an eligible default; it must not strand streams in a removed intake. A stream that reached an owned sink without an OpenWave move (for example through stream-restore memory) has no recorded original: releasing that sink moves it to the non-OpenWave default, else the highest-priority non-OpenWave output. A failed move is reported with the stream and retains the sink.
 
 Device rows capture their bound hardware node directly. A missing node remains missing rather than being replaced by another microphone. OpenWave's own virtual nodes are excluded from ordinary hardware-source/output selection to avoid internal feedback paths.
@@ -70,6 +72,8 @@ Trim is not applied by turning down an intake null sink, whose monitor and strea
 Mix masters apply to the mix destination. Saved master levels/mutes are restored to each observed runtime sink identity, then confirmed by a subsequent observation before the new sink's state can overwrite the saved values. Reusing a node name after a PipeWire restart does not prove restoration occurred. Failed writes or absent sinks do not count as restored. Once confirmed, external master changes can be observed and persisted.
 
 Routes are reconciled from observed nodes, ports and links. New route gain is established before audio is linked. Missing links are repaired even when a child remains alive; stale targets are not treated as healthy merely because the process has not exited.
+
+Muted cell routes skip redundant level writes only when the current graph reports the same owned node muted and the applied identity/level/mute still match. An external unmute or unknown/malformed node mute requires a successful corrective write; failure withholds row-silence proof and defers group handover. Nonzero trim changes retain the in-place volume-only path.
 
 ### Output safety and published inputs
 

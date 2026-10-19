@@ -101,7 +101,10 @@ impl Backend for FixtureBackend {
                         && desired.sources.values().all(|source| {
                             source.kind == SourceKind::App
                                 && source.name == "Player"
-                                && source.match_app_names == ["Player"]
+                                && source
+                                    .match_app_names
+                                    .iter()
+                                    .all(|name| matches!(name.as_str(), "Player" | "player-bin"))
                         }));
                 if !fixture_sources || !bindings.is_empty() || desired.mixes != default_mixes() {
                     return Err(self.forbidden("non-fixture routing"));
@@ -324,8 +327,15 @@ impl Rig {
                     }
                     | AppCommand::SetMaster { .. }
             ) || matches!(&command, AppCommand::AddSource { source }
-                if source.kind == SourceKind::App && source.name == "Player"
-                    && source.match_app_names == ["Player"]);
+            if source.kind == SourceKind::App && source.name == "Player"
+                && source.match_app_names.iter().all(|name| {
+                    matches!(name.as_str(), "Player" | "player-bin")
+                }))
+                || matches!(&command, AppCommand::EditSource { changes, .. }
+                    if changes.name.as_deref() == Some("Player")
+                        && changes.match_app_names.as_ref().is_some_and(Vec::is_empty)
+                        && changes.node_name.is_none()
+                        && changes.catch_all.is_none());
             if !permitted {
                 // Avoid unwinding through a GTK signal trampoline; fail on observation instead.
                 fixture_state(&state)

@@ -110,13 +110,17 @@ impl World {
         properties.insert("object.serial".into(), json!(id + 10000));
         self.objects.insert(
             id,
-            json!({"id":id,"type":"PipeWire:Interface:Node","info":{"props":properties}}),
+            json!({"id":id,"type":"PipeWire:Interface:Node","info":{"props":properties,"params":{"Props":[{"mute":false}]}}}),
         );
         for (offset, direction) in [(1, "in"), (2, "out")] {
             self.objects.insert(id + offset, json!({"id":id + offset,"type":"PipeWire:Interface:Port","info":{"props":{"node.id":id,"port.direction":direction,"audio.channel":"MONO"}}}));
         }
         self.levels.insert(id, (1.0, false));
         id
+    }
+    fn set_node_level(&mut self, node: u32, level: f64, muted: bool) {
+        self.levels.insert(node, (level, muted));
+        self.objects.get_mut(&node).unwrap()["info"]["params"] = json!({"Props":[{"mute":muted}]});
     }
     fn node_id(&self, name: &str) -> Option<u32> {
         let mut nodes = self.objects.iter().filter(|(_, node)| {
@@ -355,7 +359,7 @@ impl GraphBackend for FakeBackend {
         if muted && w.fail_silence.contains(&w.name(node)) {
             return Err(failed());
         }
-        w.levels.insert(node, (level, muted));
+        w.set_node_level(node, level, muted);
         w.level_calls += 1;
         for sink in w.sinks.values_mut() {
             if sink["index"] == node {
@@ -775,6 +779,179 @@ fn shared_capture_row_silence_is_acknowledged_only_after_owned_routes_are_muted(
         unknown.silent_sources.is_empty(),
         "unknown graph retained silence authority"
     );
+}
+
+fn shared_muted_fixture() -> Fixture {
+    let mut f = Fixture::quiet();
+    f.world.lock().unwrap().capture("shared_mic", 1);
+    f.device("a", "shared_mic", 1);
+    f.device("c", "shared_mic", 1);
+    f.bindings.get_mut("shared_mic").unwrap().owners = vec![sid("a"), sid("c")];
+    f.desired.sources.get_mut(&sid("a")).unwrap().muted = true;
+    f.cell("a", "chat", 0.7);
+    f.cell("c", "chat", 0.5);
+    f.converge(|w| {
+        w.route("shared_mic", "openwave_chat_mix", Some((0.7, true)))
+            && w.route("shared_mic", "openwave_chat_mix", Some((0.5, false)))
+    });
+    f.apply();
+    f.observation(|o| o.revision == f.revision && o.silent_sources.contains_key(&sid("a")));
+    f
+}
+
+#[test]
+fn confirmed_muted_route_skips_writes_and_retunes_volume_once() {
+    let mut f = shared_muted_fixture();
+    let route_name = routing::cell_route_name(&sid("a"), &mid("chat"));
+    let (node, identity, level_calls) = {
+        let w = f.world.lock().unwrap();
+        (
+            w.node_id(&route_name).unwrap(),
+            w.identity(&route_name),
+            w.level_calls,
+        )
+    };
+    for _ in 0..5 {
+        f.apply();
+        let observation = f.observation(|o| o.revision == f.revision);
+        assert!(observation.errors.is_empty());
+        assert!(observation.silent_sources.contains_key(&sid("a")));
+    }
+    let snapshots = {
+        let w = f.world.lock().unwrap();
+        assert_eq!(w.level_calls, level_calls);
+        assert!(w.volume_writes.is_empty());
+        w.snapshots
+    };
+    f.desired.sources.get_mut(&sid("a")).unwrap().level = 0.5;
+    f.apply();
+    f.until(|w| w.volume_writes.len() == 1);
+    {
+        let w = f.world.lock().unwrap();
+        assert_eq!(w.snapshots, snapshots, "muted trims use fast retune");
+        assert_eq!(w.level_calls, level_calls);
+        assert_eq!(w.volume_writes, vec![(node, 0.35)]);
+        assert_eq!(w.levels[&node], (0.35, true));
+    }
+    for _ in 0..5 {
+        f.apply();
+        f.observation(|o| o.revision == f.revision);
+    }
+    let w = f.world.lock().unwrap();
+    assert_eq!(
+        w.level_calls, level_calls,
+        "full passes must not repeat the trim"
+    );
+    assert_eq!(w.volume_writes, vec![(node, 0.35)]);
+    assert_eq!(w.identity(&route_name), identity);
+}
+
+#[test]
+fn external_unmute_is_corrected_and_failed_correction_blocks_handover() {
+    let mut f = shared_muted_fixture();
+    f.world.lock().unwrap().capture("mic_b", 1);
+    f.device("b", "mic_b", 2);
+    f.desired.sources.get_mut(&sid("a")).unwrap().group = "Mics".into();
+    f.desired.sources.get_mut(&sid("b")).unwrap().group = "Mics".into();
+    f.desired.sources.get_mut(&sid("b")).unwrap().muted = true;
+    f.cell("b", "chat", 0.8);
+    f.converge(|w| w.route("mic_b", "openwave_chat_mix", Some((0.8, true))));
+    f.apply();
+    f.observation(|o| o.revision == f.revision);
+    let route_name = routing::cell_route_name(&sid("a"), &mid("chat"));
+    let (node, identity, level_calls) = {
+        let mut w = f.world.lock().unwrap();
+        let node = w.node_id(&route_name).unwrap();
+        w.set_node_level(node, 0.7, false);
+        assert_eq!(
+            w.snapshot().unwrap().node(&route_name).unwrap().muted,
+            Some(false)
+        );
+        (node, w.identity(&route_name), w.level_calls)
+    };
+    f.apply();
+    let corrected = f.observation(|o| o.revision == f.revision);
+    assert!(corrected.errors.is_empty());
+    assert!(corrected.silent_sources.contains_key(&sid("a")));
+    {
+        let mut w = f.world.lock().unwrap();
+        assert_eq!(w.level_calls, level_calls + 1);
+        assert_eq!(w.identity(&route_name), identity);
+        assert_eq!(w.levels[&node], (0.7, true));
+        assert_eq!(w.sources["shared_mic"]["mute"], false);
+        w.set_node_level(node, 0.7, false);
+        w.fail_silence.insert(route_name);
+    }
+    f.desired.sources.get_mut(&sid("b")).unwrap().muted = false;
+    for _ in 0..5 {
+        f.apply();
+        let failed = f.observation(|o| o.revision == f.revision);
+        assert!(
+            failed
+                .errors
+                .iter()
+                .any(|error| error.message.contains("handover"))
+        );
+        assert!(failed.silent_sources.is_empty());
+        let w = f.world.lock().unwrap();
+        assert_eq!(w.levels[&node], (0.7, false));
+        assert!(w.route("mic_b", "openwave_chat_mix", Some((0.8, true))));
+    }
+    f.world.lock().unwrap().fail_silence.clear();
+    f.apply();
+    let recovered = f.observation(|o| o.revision == f.revision);
+    assert!(recovered.errors.is_empty());
+    assert!(recovered.silent_sources.contains_key(&sid("a")));
+    let w = f.world.lock().unwrap();
+    assert_eq!(w.levels[&node], (0.7, true));
+    assert!(w.route("mic_b", "openwave_chat_mix", Some((0.8, false))));
+}
+
+#[test]
+fn unknown_node_mute_requires_successful_silencing() {
+    let mut f = shared_muted_fixture();
+    let route_name = routing::cell_route_name(&sid("a"), &mid("chat"));
+    for params in [
+        Value::Null,
+        json!({}),
+        json!({"Props":[]}),
+        json!({"Props":{"mute":true}}),
+        json!({"Props":[{}]}),
+        json!({"Props":[{"mute":"true"}]}),
+        json!({"Props":[{"mute":1}]}),
+        json!({"Props":[{"mute":true},{"mute":false}]}),
+    ] {
+        let level_calls = {
+            let mut w = f.world.lock().unwrap();
+            let node = w.node_id(&route_name).unwrap();
+            // The fake level remains muted: only the parsed pw-dump observation
+            // is unknown, and cached intent must not substitute for that proof.
+            w.objects.get_mut(&node).unwrap()["info"]["params"] = params;
+            assert_eq!(w.snapshot().unwrap().node(&route_name).unwrap().muted, None);
+            w.fail_silence.insert(route_name.clone());
+            w.level_calls
+        };
+        f.apply();
+        let failed = f.observation(|o| o.revision == f.revision);
+        assert!(
+            failed
+                .errors
+                .iter()
+                .any(|error| error.message.contains("handover"))
+        );
+        assert!(failed.silent_sources.is_empty());
+        f.world.lock().unwrap().fail_silence.clear();
+        f.apply();
+        let recovered = f.observation(|o| o.revision == f.revision);
+        assert!(recovered.errors.is_empty());
+        assert!(recovered.silent_sources.contains_key(&sid("a")));
+        let w = f.world.lock().unwrap();
+        assert_eq!(w.level_calls, level_calls + 1);
+        assert_eq!(
+            w.snapshot().unwrap().node(&route_name).unwrap().muted,
+            Some(true)
+        );
+    }
 }
 
 #[test]
