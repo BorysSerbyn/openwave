@@ -80,6 +80,11 @@ back, and 10 s after it does. The daemon log shows each step:
 journalctl --user -u openwave | grep -E 'Output .* (disappeared|is back|appeared)|Released output'
 ```
 
+If capture is already silent (the guard wasn't running, or another cause),
+a replug clears it. With `--auto-recover`, the daemon instead USB-resets the
+Wave XLR once the keepalive reports digital silence, at most once per 10
+minutes, and the guard keeps playback off the output while it comes back.
+
 To check the start order yourself, compare `trigger_time` in
 `/proc/asound/<card>/pcm0p/sub0/status` (playback) and `pcm0c` (capture):
 capture should be the earlier of the two.
