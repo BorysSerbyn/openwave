@@ -539,3 +539,32 @@ impl Guard {
         }
     }
 }
+
+/// USB-reset the Wave XLR behind a capture node. Capture delivering digital
+/// silence is the shared-clock wedge; recycling the keepalive can't clear it,
+/// a reset can while the guard keeps playback off the reappearing sink.
+pub fn reset_unit(capture_node: &str) -> std::result::Result<(), String> {
+    const VID: u16 = 0x0fd9;
+    const PID: u16 = 0x007d;
+    let serial = node_serial(capture_node).ok_or("not a Wave XLR capture node")?;
+    let devices = rusb::devices().map_err(|e| e.to_string())?;
+    for device in devices.iter() {
+        let Ok(desc) = device.device_descriptor() else {
+            continue;
+        };
+        if (desc.vendor_id(), desc.product_id()) != (VID, PID) {
+            continue;
+        }
+        let Ok(handle) = device.open() else { continue };
+        if handle
+            .read_serial_number_string_ascii(&desc)
+            .ok()
+            .as_deref()
+            != Some(serial)
+        {
+            continue;
+        }
+        return handle.reset().map_err(|e| e.to_string());
+    }
+    Err(format!("no Wave XLR with serial {serial}"))
+}
