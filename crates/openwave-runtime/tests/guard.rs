@@ -94,7 +94,7 @@ fn pactl_output_maps_streams_to_sinks() {
 
     let inputs = parse_sink_inputs(
         r#"[{"index":101,"sink":56,"properties":{"object.id":"212","application.name":"Firefox"}},
-            {"index":102,"sink":70,"properties":{}},
+            {"index":102,"sink":70,"properties":{"node.name":"openwave_loop_output_personal"}},
             {"index":103,"sink":56}]"#,
     );
     assert_eq!(
@@ -103,17 +103,20 @@ fn pactl_output_maps_streams_to_sinks() {
             SinkInput {
                 index: 101,
                 sink: 56,
-                object_id: Some(212)
+                object_id: Some(212),
+                name: Some("Firefox".into()),
             },
             SinkInput {
                 index: 102,
                 sink: 70,
-                object_id: None
+                object_id: None,
+                name: Some("openwave_loop_output_personal".into()),
             },
             SinkInput {
                 index: 103,
                 sink: 56,
-                object_id: None
+                object_id: None,
+                name: None,
             },
         ]
     );
