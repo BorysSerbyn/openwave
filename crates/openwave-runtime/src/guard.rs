@@ -13,8 +13,12 @@
 //! So the guard acts on the disappearance: it records which streams play to
 //! the Wave XLR sink, and the moment that sink is removed it moves them to a
 //! temporary `openwave-hold` null sink. They are already elsewhere when the
-//! unit comes back, and stay there until the keepalive reports capture data
-//! for the same unit; then they go back. A sink that appears without a
+//! unit comes back, and stay there until the unit itself delivers capture
+//! data: its ALSA capture `hw_ptr` advances, which takes about a second after
+//! capture starts. Starting playback in that second wedges it as well, and the
+//! keepalive can't tell, since PipeWire feeds it silence meanwhile. Then the
+//! streams go back. While a hold lasts, `openwave-hold` is also the default
+//! sink, so streams that follow the default can't jump onto the returning unit. A sink that appears without a
 //! preceding removal is held the same way, and streams landing on a held sink
 //! are moved off every 50 ms as a backstop. Streams that followed the default
 //! sink follow it again afterwards.
@@ -80,6 +84,8 @@ pub struct SinkEvent {
     pub name: String,
     pub removed: bool,
     pub initial: bool,
+    /// ALSA card of an added sink (`alsa.card`).
+    pub card: Option<u64>,
 }
 
 /// One `pw-dump --monitor` batch to sink events; `seen` maps ids to sink names.
@@ -99,6 +105,7 @@ pub fn sink_events(
                     name,
                     removed: true,
                     initial: false,
+                    card: None,
                 });
             }
             continue;
@@ -114,10 +121,14 @@ pub fn sink_events(
             continue;
         };
         seen.insert(id, name.to_owned());
+        let card = props["alsa.card"]
+            .as_u64()
+            .or_else(|| props["alsa.card"].as_str().and_then(|c| c.parse().ok()));
         events.push(SinkEvent {
             name: name.to_owned(),
             removed: false,
             initial,
+            card,
         });
     }
     events
@@ -195,6 +206,31 @@ fn sink_inputs() -> Vec<SinkInput> {
 
 fn default_sink() -> Option<String> {
     pactl(&["get-default-sink"]).map(|name| name.trim().to_owned())
+}
+
+/// The unit's capture is delivering samples: its ALSA capture PCM is running
+/// and `hw_ptr` has moved past zero.
+pub fn capture_status_delivering(status: &str) -> bool {
+    let running = status.lines().any(|l| l.trim() == "state: RUNNING");
+    let hw_ptr = status.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("hw_ptr")?
+            .trim()
+            .strip_prefix(':')?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    });
+    running && hw_ptr.is_some_and(|p| p > 0)
+}
+
+fn capture_delivering(card: u64) -> bool {
+    std::fs::read_to_string(format!("/proc/asound/card{card}/pcm0c/sub0/status"))
+        .is_ok_and(|status| capture_status_delivering(&status))
+}
+
+fn set_default_sink(sink: &str) -> bool {
+    pactl(&["set-default-sink", sink]).is_some()
 }
 
 fn move_stream(index: u64, sink: &str) -> bool {
@@ -342,6 +378,10 @@ struct Guard {
     default: HashSet<String>,
     held: HashMap<String, Hold>,
     module: Option<String>,
+    /// ALSA card of each guarded sink seen.
+    cards: HashMap<String, u64>,
+    /// The guarded sink to make the default again when its hold ends.
+    restore_default: Option<String>,
 }
 
 impl Guard {
@@ -362,6 +402,7 @@ impl Guard {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             self.evict_backstop();
+            self.release_delivering();
             self.expire();
             if last_track.elapsed() >= TRACK_EVERY {
                 last_track = Instant::now();
@@ -391,6 +432,9 @@ impl Guard {
                 streams.len()
             );
             let was_default = self.default.contains(&name);
+            if was_default {
+                self.hold_default(&name);
+            }
             self.held.insert(
                 name,
                 Hold {
@@ -408,6 +452,9 @@ impl Guard {
             return;
         };
         self.present.insert(name.clone(), index);
+        if let Some(card) = event.card {
+            self.cards.insert(name.clone(), card);
+        }
         let already: Vec<SinkInput> = if event.initial {
             Vec::new()
         } else {
@@ -430,6 +477,9 @@ impl Guard {
             self.evict_backstop();
         } else if !event.initial && self.ensure_hold_sink() {
             let was_default = default_sink().as_deref() == Some(name.as_str());
+            if was_default {
+                self.hold_default(&name);
+            }
             let now = Instant::now();
             self.held.insert(
                 name.clone(),
@@ -454,14 +504,49 @@ impl Guard {
         let Some(key) = device_key(capture) else {
             return;
         };
+        // Normally the release waits for the unit's own capture data (see
+        // release_delivering); this only covers sinks without a known card.
         let ready: Vec<String> = self
             .held
             .keys()
-            .filter(|sink| device_key(sink) == Some(key) && self.present.contains_key(*sink))
+            .filter(|sink| {
+                device_key(sink) == Some(key)
+                    && self.present.contains_key(*sink)
+                    && !self.cards.contains_key(*sink)
+            })
             .cloned()
             .collect();
         for sink in ready {
-            self.release(&sink, "capture running");
+            self.release(&sink, "capture running, card unknown");
+        }
+    }
+
+    /// Release held, present sinks whose unit delivers capture data.
+    fn release_delivering(&mut self) {
+        let ready: Vec<String> = self
+            .held
+            .keys()
+            .filter(|sink| {
+                self.present.contains_key(*sink)
+                    && self
+                        .cards
+                        .get(*sink)
+                        .is_some_and(|card| capture_delivering(*card))
+            })
+            .cloned()
+            .collect();
+        for sink in ready {
+            self.release(&sink, "capture delivering");
+        }
+    }
+
+    /// Make the hold sink the default while `sink` is held, so streams that
+    /// follow the default don't land on the unit when it returns.
+    fn hold_default(&mut self, sink: &str) {
+        if self.restore_default.is_none() && self.ensure_hold_sink() && set_default_sink(HOLD_SINK)
+        {
+            self.restore_default = Some(sink.to_owned());
+            log::info!("Default sink is {HOLD_SINK} while {sink} is held");
         }
     }
 
@@ -481,6 +566,11 @@ impl Guard {
                 && let Some(hold) = self.held.get_mut(sink)
             {
                 hold.moved += 1;
+                log::info!(
+                    "Moved stream {} ({}) off held output {sink}",
+                    stream.index,
+                    stream.name.as_deref().unwrap_or("?")
+                );
             }
         }
     }
@@ -614,6 +704,14 @@ impl Guard {
         let Some(hold) = self.held.remove(sink) else {
             return;
         };
+        if self.restore_default.as_deref() == Some(sink) {
+            self.restore_default = None;
+            // The hold sink may already be gone (unloaded while the unit was
+            // away), so restore whenever the unit is present.
+            if self.present.contains_key(sink) && set_default_sink(sink) {
+                log::info!("Default sink is {sink} again");
+            }
+        }
         let (mut back, mut failed) = (0, 0);
         let hold_index = sink_index(HOLD_SINK);
         if hold_index.is_some() || !hold.parked.is_empty() {

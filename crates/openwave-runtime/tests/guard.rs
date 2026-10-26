@@ -1,6 +1,6 @@
 use openwave_runtime::guard::{
-    SinkEvent, SinkInput, device_key, is_guarded_sink, node_serial, parse_short_sinks,
-    parse_sink_inputs, sink_events,
+    SinkEvent, SinkInput, capture_status_delivering, device_key, is_guarded_sink, node_serial,
+    parse_short_sinks, parse_sink_inputs, sink_events,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ fn only_the_wave_xlr_sink_is_guarded() {
 fn monitor_batches_report_initial_removed_and_returning_sinks() {
     let mut seen = HashMap::new();
     let sink = json!({"id": 57, "type": "PipeWire:Interface:Node",
-        "info": {"props": {"node.name": SINK, "media.class": "Audio/Sink"}}});
+        "info": {"props": {"node.name": SINK, "media.class": "Audio/Sink", "alsa.card": 0}}});
     let source = json!({"id": 58, "type": "PipeWire:Interface:Node",
         "info": {"props": {"node.name": SOURCE, "media.class": "Audio/Source"}}});
 
@@ -51,7 +51,8 @@ fn monitor_batches_report_initial_removed_and_returning_sinks() {
         vec![SinkEvent {
             name: SINK.into(),
             removed: false,
-            initial: true
+            initial: true,
+            card: Some(0)
         }]
     );
     assert!(
@@ -69,7 +70,8 @@ fn monitor_batches_report_initial_removed_and_returning_sinks() {
         vec![SinkEvent {
             name: SINK.into(),
             removed: true,
-            initial: false
+            initial: false,
+            card: None
         }]
     );
 
@@ -79,7 +81,8 @@ fn monitor_batches_report_initial_removed_and_returning_sinks() {
         vec![SinkEvent {
             name: SINK.into(),
             removed: false,
-            initial: false
+            initial: false,
+            card: Some(0)
         }]
     );
 }
@@ -121,4 +124,22 @@ fn pactl_output_maps_streams_to_sinks() {
         ]
     );
     assert!(parse_sink_inputs("not json").is_empty());
+}
+
+#[test]
+fn only_a_running_capture_with_samples_counts_as_delivering() {
+    let running = |hw_ptr: u32| {
+        format!(
+            "state: RUNNING\nowner_pid   : 1\ntrigger_time: 64010.982\n-----\nhw_ptr      : {hw_ptr}\nappl_ptr    : 0\n"
+        )
+    };
+    assert!(
+        !capture_status_delivering(&running(0)),
+        "started but no samples yet"
+    );
+    assert!(capture_status_delivering(&running(1728)));
+    assert!(!capture_status_delivering("closed\n"));
+    assert!(!capture_status_delivering(
+        "state: SETUP\nhw_ptr      : 480\n"
+    ));
 }
