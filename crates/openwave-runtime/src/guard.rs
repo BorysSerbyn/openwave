@@ -16,9 +16,14 @@
 //! unit comes back, and stay there until the keepalive reports capture data
 //! for the same unit; then they go back. A sink that appears without a
 //! preceding removal is held the same way, and streams landing on a held sink
-//! are moved off every 50 ms as a backstop. The hold sink only exists while
-//! something is held. Streams that followed the default sink follow it again
-//! afterwards.
+//! are moved off every 50 ms as a backstop. Streams that followed the default
+//! sink follow it again afterwards.
+//!
+//! A disconnect can last minutes or hours. After 30 s the held streams are
+//! parked on the default
+//! sink so they keep playing, pinned there so they don't follow the Wave XLR
+//! back on their own, and the hold stays armed until the unit returns, however
+//! late. The hold sink only exists while streams are actually on it.
 //!
 //! Only the Wave XLR is guarded: it is the only unit this was observed and
 //! tested on. The XLR Dock and Wave:3 share the clock design and can be added
@@ -136,6 +141,8 @@ pub struct SinkInput {
     pub sink: u64,
     /// PipeWire node id, for clearing the explicit target a move leaves.
     pub object_id: Option<u64>,
+    /// Application or node name, for the log.
+    pub name: Option<String>,
 }
 
 pub fn parse_sink_inputs(json: &str) -> Vec<SinkInput> {
@@ -151,6 +158,10 @@ pub fn parse_sink_inputs(json: &str) -> Vec<SinkInput> {
                 object_id: item["properties"]["object.id"]
                     .as_str()
                     .and_then(|id| id.parse().ok()),
+                name: ["application.name", "node.name", "media.name"]
+                    .iter()
+                    .find_map(|key| item["properties"][*key].as_str())
+                    .map(str::to_owned),
             })
         })
         .collect()
@@ -205,6 +216,21 @@ struct Hold {
     moved: usize,
     /// The held sink was the default sink when the hold began.
     was_default: bool,
+    /// Streams parked on another sink while the unit stayed away.
+    parked: Vec<u64>,
+    parked_at: Option<Instant>,
+}
+
+fn names(streams: &[SinkInput]) -> String {
+    let names: Vec<&str> = streams
+        .iter()
+        .map(|s| s.name.as_deref().unwrap_or("?"))
+        .collect();
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
 }
 
 enum Message {
@@ -372,6 +398,8 @@ impl Guard {
                     returned: None,
                     moved,
                     was_default,
+                    parked: Vec::new(),
+                    parked_at: None,
                 },
             );
             return;
@@ -380,12 +408,26 @@ impl Guard {
             return;
         };
         self.present.insert(name.clone(), index);
-        if let Some(hold) = self.held.get_mut(&name) {
-            hold.returned = Some(Instant::now());
-            log::info!(
-                "Output {name} is back after {} ms; its streams are still held",
-                hold.since.elapsed().as_millis()
-            );
+        let already: Vec<SinkInput> = if event.initial {
+            Vec::new()
+        } else {
+            sink_inputs()
+                .into_iter()
+                .filter(|s| s.sink == index)
+                .collect()
+        };
+        if self.held.contains_key(&name) {
+            self.ensure_hold_sink();
+            if let Some(hold) = self.held.get_mut(&name) {
+                hold.returned = Some(Instant::now());
+                log::info!(
+                    "Output {name} is back after {} ms; its streams are still held ({} parked); already on it: {}",
+                    hold.since.elapsed().as_millis(),
+                    hold.parked.len(),
+                    names(&already)
+                );
+            }
+            self.evict_backstop();
         } else if !event.initial && self.ensure_hold_sink() {
             let was_default = default_sink().as_deref() == Some(name.as_str());
             let now = Instant::now();
@@ -396,9 +438,15 @@ impl Guard {
                     returned: Some(now),
                     moved: 0,
                     was_default,
+                    parked: Vec::new(),
+                    parked_at: None,
                 },
             );
-            log::info!("Output {name} appeared; holding playback until capture runs");
+            log::info!(
+                "Output {name} appeared; holding playback until capture runs; already on it: {}",
+                names(&already)
+            );
+            self.evict_backstop();
         }
     }
 
@@ -438,19 +486,74 @@ impl Guard {
     }
 
     fn expire(&mut self) {
-        let expired: Vec<(String, &'static str)> = self
+        let away: Vec<String> = self
             .held
             .iter()
-            .filter_map(|(sink, hold)| match hold.returned {
-                None if hold.since.elapsed() > MAX_WAIT_RETURN => {
-                    Some((sink.clone(), "output did not come back"))
-                }
-                Some(at) if at.elapsed() > MAX_HOLD => Some((sink.clone(), "timeout")),
-                _ => None,
+            .filter(|(_, h)| {
+                h.returned.is_none() && h.parked_at.is_none() && h.since.elapsed() > MAX_WAIT_RETURN
             })
+            .map(|(sink, _)| sink.clone())
             .collect();
-        for (sink, reason) in expired {
-            self.release(&sink, reason);
+        for sink in away {
+            self.park(&sink);
+        }
+        let expired: Vec<String> = self
+            .held
+            .iter()
+            .filter(|(_, h)| h.returned.is_some_and(|at| at.elapsed() > MAX_HOLD))
+            .map(|(sink, _)| sink.clone())
+            .collect();
+        for sink in expired {
+            self.release(&sink, "timeout");
+        }
+    }
+
+    /// The unit is still away: let the held streams play on the default sink,
+    /// pinned there, and keep the hold armed for whenever the unit returns.
+    fn park(&mut self, sink: &str) {
+        let target = default_sink().filter(|d| d != HOLD_SINK && d != sink);
+        let on_hold: Vec<SinkInput> = sink_index(HOLD_SINK)
+            .map(|index| {
+                sink_inputs()
+                    .into_iter()
+                    .filter(|s| s.sink == index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let parked: Vec<u64> = match &target {
+            Some(target) => on_hold
+                .iter()
+                .filter(|s| move_stream(s.index, target))
+                .map(|s| s.index)
+                .collect(),
+            None => Vec::new(),
+        };
+        log::info!(
+            "Output {sink} is still away after {} s; parked {} of {} streams ({}) on {} until it returns",
+            MAX_WAIT_RETURN.as_secs(),
+            parked.len(),
+            on_hold.len(),
+            names(&on_hold),
+            target
+                .as_deref()
+                .unwrap_or("nothing (no other default sink)")
+        );
+        if let Some(hold) = self.held.get_mut(sink) {
+            hold.parked.extend(parked);
+            hold.parked_at = Some(Instant::now());
+        }
+        self.unload_idle_hold_sink();
+    }
+
+    /// The hold sink is only needed while a held unit is present or streams
+    /// are still on it.
+    fn unload_idle_hold_sink(&mut self) {
+        let needed = self
+            .held
+            .values()
+            .any(|h| h.returned.is_some() || h.parked_at.is_none());
+        if !needed && let Some(module) = self.module.take() {
+            let _ = pactl(&["unload-module", &module]);
         }
     }
 
@@ -512,9 +615,14 @@ impl Guard {
             return;
         };
         let (mut back, mut failed) = (0, 0);
-        if let Some(hold_index) = sink_index(HOLD_SINK) {
+        let hold_index = sink_index(HOLD_SINK);
+        if hold_index.is_some() || !hold.parked.is_empty() {
             let follow = hold.was_default && default_sink().as_deref() == Some(sink);
-            for stream in sink_inputs().into_iter().filter(|s| s.sink == hold_index) {
+            let parked: HashSet<u64> = hold.parked.iter().copied().collect();
+            let returning = sink_inputs()
+                .into_iter()
+                .filter(|s| Some(s.sink) == hold_index || parked.contains(&s.index));
+            for stream in returning {
                 if move_stream(stream.index, sink) {
                     back += 1;
                     if follow && let Some(id) = stream.object_id {
@@ -532,11 +640,7 @@ impl Guard {
             hold.since.elapsed().as_millis(),
             hold.moved
         );
-        if self.held.is_empty()
-            && let Some(module) = self.module.take()
-        {
-            let _ = pactl(&["unload-module", &module]);
-        }
+        self.unload_idle_hold_sink();
     }
 }
 
